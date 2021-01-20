@@ -1,5 +1,6 @@
-use rustable::gatt::{CharFlags, LocalCharBase, LocalCharactersitic, LocalServiceBase, Service};
-use rustable::{AdType, Advertisement, Bluetooth, Error as BLEError, ValOrFn, MAX_APP_MTU, UUID};
+use clap::{Arg, App};
+use rustable::gatt::{CharFlags, LocalCharBase, LocalServiceBase, DescFlags, LocalDescBase, HasChildren,ValOrFn};
+use rustable::{AdType, Advertisement, Bluetooth, Error as BLEError, MAX_APP_MTU, UUID, ToUUID};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::io::Write;
@@ -13,6 +14,9 @@ use airboard_server::{InSyncer, OutSyncer};
 const COPY_UUID: &'static str = "4981333e-2d59-43b2-8dc3-8fedee1472c5";
 const READ_UUID: &'static str = "07178017-1879-451b-9bb5-3ff13bb85b70";
 const WRITE_UUID: &'static str = "07178017-1879-451b-9bb5-3ff13bb85b71";
+const VER_UUID: &'static str = "b05778f1-5a88-46a3-b6c8-2d154d629910";
+
+const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
 fn update_clipboard(buf: &[u8]) -> Result<(), std::io::Error> {
     let proc = Command::new("wl-copy").stdin(Stdio::piped()).spawn()?;
@@ -35,16 +39,24 @@ fn get_clipboard() -> Result<Vec<u8>, std::io::Error> {
 }
 
 fn main() {
-    let name = Command::new("hostname")
-        .output()
-        .expect("Failed to get device hostname");
-    let mut name = String::from_utf8(name.stdout).expect("Invalid hostname received.");
-    name.pop();
-    let mut blue = Bluetooth::new("ecp", "/org/bluez/hci0".to_string()).unwrap();
-    let verbose = 1;
-    blue.filter_dest = None;
-
-    let serv_uuid = Rc::from(COPY_UUID.to_string());
+	let parser = parser();
+	let args = parser.get_matches();
+	let name = match args.value_of("hostname") {
+		Some(n) => n.to_string(),
+		None => {
+			let res = Command::new("hostname").output().expect("Failed to get device hostname!");
+			let mut n = String::from_utf8(res.stdout).expect("Invalid hostname received!");
+			n.pop();
+			n
+		}
+	};
+    let mut blue = Bluetooth::new("io.maves.airboard".to_string(), "/org/bluez/hci0".to_string()).unwrap();
+    let verbose = args.occurrences_of("verbose") as u8;
+	blue.verbose = verbose;
+	if args.is_present("no-filter") {
+		blue.set_filter(None).unwrap();
+	}
+    let serv_uuid = COPY_UUID.to_uuid();
     let mut copy_service = LocalServiceBase::new(&serv_uuid, true);
 
     let cur_clip = match get_clipboard() {
@@ -70,7 +82,7 @@ fn main() {
     read_flags.encrypt_write = true;
     read_flags.write_wo_response = true;
     // create read characteristic
-    let read_uuid = Rc::from(READ_UUID.to_string());
+    let read_uuid = READ_UUID.to_uuid();
     let mut read_char = LocalCharBase::new(&read_uuid, read_flags);
     // neable the write fd and setup the write callback
     read_char.enable_write_fd(true);
@@ -85,9 +97,19 @@ fn main() {
         os_clone.borrow_mut().update_pos(data);
         Ok((None, false))
     }));
+	// create protocol version descriptor
+	let mut ver_flags = DescFlags::default();
+	ver_flags.read = true;
+	ver_flags.encrypt_read = true;
+	ver_flags.secure_read = true;
+	let ver_uuid = VER_UUID.to_uuid();
+	let mut ver_desc = LocalDescBase::new(&ver_uuid, ver_flags);
+	ver_desc.vf = ValOrFn::Value([0_u8, 0][..].into());
+
+	read_char.add_desc(ver_desc);
     copy_service.add_char(read_char);
     //permissions
-    let write_uuid = Rc::from(WRITE_UUID.to_string());
+    let write_uuid = WRITE_UUID.to_uuid();
     let mut write_flags = CharFlags::default();
     write_flags.secure_write = true;
     write_flags.encrypt_write = true;
@@ -116,6 +138,10 @@ fn main() {
         let cv = syncer.read_fn();
         Ok((Some(ValOrFn::Value(cv)), true))
     }));
+
+	let mut ver_desc = LocalDescBase::new(&ver_uuid, ver_flags);
+	ver_desc.vf = ValOrFn::Value([0, 0][..].into());
+	write_char.add_desc(ver_desc);
     copy_service.add_char(write_char);
     /*
     let mut write_serv = copy_service.get_char(&write_uuid);
@@ -140,7 +166,7 @@ fn main() {
         }
     };
     let mut copy_serv = blue.get_service(&serv_uuid).unwrap();
-    let mut read_char = copy_serv.get_char(&read_uuid).unwrap();
+    let mut read_char = copy_serv.get_child(&read_uuid).unwrap();
     let os_clone = out_syncer.clone();
     read_char.write_val_or_fn(&mut ValOrFn::Function(Box::new(move || {
         os_clone.borrow().read_fn()
@@ -152,11 +178,11 @@ fn main() {
         let now = Instant::now();
         blue.process_requests().unwrap();
         let mut serv = blue.get_service(&serv_uuid).unwrap();
-        let mut write_char = serv.get_char(&write_uuid).unwrap();
+        let mut write_char = serv.get_child(&write_uuid).unwrap();
         write_char.check_write_fd();
 
         // check for local updates to clipboard;
-        let mut read_char = serv.get_char(&read_uuid).unwrap();
+        let mut read_char = serv.get_child(&read_uuid).unwrap();
         read_char.check_write_fd();
         if let Err(e) = out_syncer
             .borrow_mut()
@@ -181,7 +207,7 @@ fn main() {
             }
             match blue.restart_adv(adv_idx) {
                 Ok(v) => {
-                    if (v) {
+                    if v {
                         if let Err(e) = blue.set_discoverable(true) {
                             eprintln!("Failed to set to discoverable: {:?}", e);
                         }
@@ -198,4 +224,27 @@ fn main() {
     }
 }
 
-
+fn parser<'a, 'b>() -> App<'a, 'b> {
+	App::new("Airboard Server")
+		.version(VERSION)
+		.author("Curtis Maves <curtis@maves.io>")
+		.arg(
+			Arg::with_name("verbose")
+				.short("v")
+				.long("verbose")
+				.multiple(true)
+		)
+		.arg(
+			Arg::with_name("no-filter")
+				.short("n")
+				.long("nofilter")
+				.help("Allows all incoming Dbus messages.")
+		)
+		.arg(
+			Arg::with_name("hostname")
+				.short("h")
+				.long("hostname")
+				.value_name("NAME")
+				.takes_value(true)
+		)
+}

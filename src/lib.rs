@@ -1,6 +1,6 @@
 
-use rustable::{Error as BLEError, ValOrFn, MAX_APP_MTU};
-use rustable::gatt::{LocalCharactersitic, CharValue};
+use rustable::{Error as BLEError, MAX_APP_MTU};
+use rustable::gatt::{LocalChar, AttValue, ValOrFn};
 use sha2::{Digest, Sha256};
 
 pub struct OutSyncer {
@@ -27,17 +27,17 @@ impl OutSyncer {
 	}
     pub fn indicate_local(
         &mut self,
-        local_char: &mut LocalCharactersitic,
+        local_char: &mut LocalChar,
         max_out: usize,
     ) -> Result<(), BLEError> {
         if self.buf.len() == self.cur_pos {
             return Ok(());
         }
-        let mut vf = ValOrFn::Value(CharValue::default());
+        let mut vf = ValOrFn::Value(AttValue::default());
         local_char.write_val_or_fn(&mut vf); // remove the vf function so we can write custom data
         if self.cur_pos == std::usize::MAX {
             // we need to write the initial data to tell the GATT client how long what we are copying is
-            let mut v = CharValue::default();
+            let mut v = AttValue::default();
             v.extend_from_slice(&std::u32::MAX.to_be_bytes());
             v.extend_from_slice(&(self.buf.len() as u32).to_be_bytes());
             v.extend_from_slice(&self.hash);
@@ -53,7 +53,7 @@ impl OutSyncer {
         let target = self.buf.len().min(self.cur_pos + max_out);
         while self.written < target {
             let end = target.min(self.written + MAX_APP_MTU - 8);
-            let mut v = CharValue::default();
+            let mut v = AttValue::default();
             let l = end - self.written;
             v.extend_from_slice(&self.written.to_be_bytes()[4..8]);
             v.extend_from_slice(&l.to_be_bytes()[4..8]);
@@ -71,16 +71,16 @@ impl OutSyncer {
         local_char.write_val_or_fn(&mut vf);
         Ok(())
     }
-    pub fn read_fn(&self) -> CharValue {
+    pub fn read_fn(&self) -> AttValue {
         if self.cur_pos == std::usize::MAX {
-            let mut v = CharValue::default();
+            let mut v = AttValue::default();
             v.extend_from_slice(&std::u32::MAX.to_be_bytes());
             v.extend_from_slice(&(self.buf.len() as u32).to_be_bytes());
             v.extend_from_slice(&self.hash);
             v
         } else {
             let end = self.buf.len().min(self.cur_pos + 256 - 8);
-            let mut v = CharValue::default();
+            let mut v = AttValue::default();
             // let l = end - self.cur_pos;
             let l = match end.checked_sub(self.cur_pos) {
                 Some(v) => v,
@@ -130,8 +130,8 @@ pub struct InSyncer {
     data_buf: Vec<u8>,
 }
 impl InSyncer {
-    pub fn read_fn(&self) -> CharValue {
-        let mut ret = CharValue::default();
+    pub fn read_fn(&self) -> AttValue {
+        let mut ret = AttValue::default();
         ret.extend_from_slice(&self.data_buf.len().to_be_bytes()[4..8]);
         ret.extend_from_slice(&self.msg_length.to_be_bytes()[4..8]);
         ret.extend_from_slice(&self.hash);
