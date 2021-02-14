@@ -2,27 +2,106 @@ use clap::{Arg, App};
 use rustable::gatt::{CharFlags, LocalCharBase, LocalServiceBase, DescFlags, LocalDescBase, HasChildren,ValOrFn};
 use rustable::{AdType, Advertisement, Bluetooth, Error as BLEError, MAX_APP_MTU, UUID, ToUUID};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::cell::RefCell;
-use std::io::Write;
+use std::borrow::Borrow;
+use std::io::{Read,Write};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use airboard_server::{InSyncer, OutSyncer};
-
+use airboard_server::{InSyncer, OutSyncer, Clip};
+use wl_clipboard_rs::paste::Error as PasteError;
 
 const COPY_UUID: &'static str = "4981333e-2d59-43b2-8dc3-8fedee1472c5";
 const READ_UUID: &'static str = "07178017-1879-451b-9bb5-3ff13bb85b70";
 const WRITE_UUID: &'static str = "07178017-1879-451b-9bb5-3ff13bb85b71";
+
 const VER_UUID: &'static str = "b05778f1-5a88-46a3-b6c8-2d154d629910";
+const LEN_UUID: &'static str = "b05778f1-5a88-46a3-b6c8-2d154d629911";
+const MIME_UUID: &'static str = "b05778f1-5a88-46a3-b6c8-2d154d629912";
+const HASH_UUID: &'static str = "b05778f1-5a88-46a3-b6c8-2d154d629913";
+//const LOC_UUID: &'static str = "b05778f1-5a88-46a3-b6c8-2d154d629912";
 
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
-fn update_clipboard(buf: &[u8]) -> Result<(), std::io::Error> {
-    let proc = Command::new("wl-copy").stdin(Stdio::piped()).spawn()?;
-    proc.stdin.unwrap().write(buf).map(|_| ())
+fn update_clipboard(clip: &Clip) -> Result<(), std::io::Error> {
+    let proc = Command::new("wl-copy")
+        .arg("-t")
+        .arg(clip.mime())
+        .stdin(Stdio::piped()).spawn()?;
+    proc.stdin.unwrap().write(clip.data()).map(|_| ())
 }
-fn get_clipboard() -> Result<Vec<u8>, std::io::Error> {
+fn resolve_mime_type(mut mimes: HashSet<String>) -> Option<String> {
+    if let Some(s) = mimes.take("text/plain;charset=utf-8") {
+        return Some(s);
+    }
+    let mut mimes: Vec<String> = mimes.into_iter().collect();
+    mimes.sort_unstable();
+    
+    let mut start = binary_search(&mimes[..], "image/").unwrap_err();
+    while start < mimes.len() && mimes[start].starts_with("image/") {
+        let second = &mimes[start][6..];
+        match second {
+            "png" | "jpeg" => return Some(mimes.remove(start)),
+            _ => ()
+        }
+        start += 1;
+    }
+    let mut start = binary_search(&mimes[..], "text/").unwrap_err();
+    while start < mimes.len() && mimes[start].starts_with("text/") {
+        let second = &mimes[start][5..];
+        match second {
+            "html" => return Some(mimes.remove(start)),
+            _ => ()
+        }
+        start += 1;
+    }
+    return None 
+}
+fn binary_search<T, K>(list: &[T], k: &K) -> Result<usize, usize> 
+    where
+        T: Borrow<K>,
+        K: Ord + ?Sized
+{
+    list.binary_search_by(|p| p.borrow().cmp(k))
+}
+fn get_clipboard() -> Result<Clip, PasteError> {
+
+    loop {
+        let mime_bytes = Command::new("wl-paste")
+            .arg("-l")
+            .output().map_err(|e| PasteError::WaylandCommunication(e))?;
+        // let mimes = get_mime_types(ClipboardType::Regular, Seat::Unspecified)?;
+        let mimes: HashSet<String> = std::str::from_utf8(&mime_bytes.stdout)
+            .map_err(|_| PasteError::NoMimeType)?
+            .lines().map(|s| s.to_owned()).collect();
+        let mime = match resolve_mime_type(mimes) {
+            Some(mime) => mime,
+            None => return Err(PasteError::NoMimeType)
+        };
+        let out = match Command::new("wl-paste")
+            .arg("-n")
+            .arg("-t")
+            .arg(&mime)
+            .output() 
+        {
+            Ok(out) => out.stdout,
+            Err(_) => continue
+        };
+        return Ok(Clip::new(out, mime));
+
+        /*
+        let (mut out, _) = match get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Specific(&mime))        {
+            Ok(o) => o,
+            Err(PasteError::NoMimeType) => continue,
+            Err(e) => return Err(e)
+        };
+        let mut ret = vec![];
+        out.read_to_end(&mut ret).map_err(|e| PasteError::WaylandCommunication(e))?;
+        */
+    }
+    /*
     let out = Command::new("wl-paste")
         .arg("-n")
         .arg("-t")
@@ -35,6 +114,18 @@ fn get_clipboard() -> Result<Vec<u8>, std::io::Error> {
             std::io::ErrorKind::Other,
             "Non-zero return",
         ))
+    }
+    */
+}
+static mut VERBOSE: u8 = 0;
+fn set_verbose(level: u8) {
+    unsafe {
+        VERBOSE = level;
+    }
+}
+fn verbose() -> u8 {
+    unsafe {
+        VERBOSE
     }
 }
 
@@ -52,6 +143,7 @@ fn main() {
 	};
     let mut blue = Bluetooth::new("io.maves.airboard".to_string(), "/org/bluez/hci0".to_string()).unwrap();
     let verbose = args.occurrences_of("verbose") as u8;
+    set_verbose(verbose);
 	blue.verbose = verbose;
 	if args.is_present("no-filter") {
 		blue.set_filter(None).unwrap();
@@ -63,7 +155,7 @@ fn main() {
         Ok(o) => o,
         Err(e) => {
             eprintln!("Failed to read clipboard: {:?}", e);
-            Vec::new()
+            Clip::default()
         }
     };
     let out_syncer = Rc::new(RefCell::new(OutSyncer::new(cur_clip, verbose)));
@@ -86,17 +178,36 @@ fn main() {
     let mut read_char = LocalCharBase::new(&read_uuid, read_flags);
     // neable the write fd and setup the write callback
     read_char.enable_write_fd(true);
+
     let os_clone = out_syncer.clone();
     read_char.write_callback = Some(Box::new(move |data| {
-        if data.len() != 40 {
+        if verbose >= 2 {
+            eprintln!("read_char.write_callback(): Read characteristic written to with: {:?}", data);
+        }
+        if data.len() != 4 && data.len() != 36 {
             return Err((
                 "org.bluez.DBus.Failed".to_string(),
-                Some("Data was not 40 bytes long".to_string()),
+                Some("Data was not 4 or 36 bytes long".to_string()),
             ));
         }
         os_clone.borrow_mut().update_pos(data);
         Ok((None, false))
     }));
+
+    let os_clone = out_syncer.clone();
+    read_char.write_val_or_fn(&mut ValOrFn::Function(Box::new(move || {
+        if verbose > 2 {
+            eprintln!("Read characteristic read.");
+        }
+        let mut bm = os_clone.borrow_mut();
+        if let Some((old, new)) = bm.reduce_notify_len() {
+            if verbose >= 2 {
+                eprintln!("Erronous read, reducing notify_len from {} to {}", old, new);
+            }
+        }
+        bm.read_fn()
+    })));
+
 	// create protocol version descriptor
 	let mut ver_flags = DescFlags::default();
 	ver_flags.read = true;
@@ -104,9 +215,47 @@ fn main() {
 	ver_flags.secure_read = true;
 	let ver_uuid = VER_UUID.to_uuid();
 	let mut ver_desc = LocalDescBase::new(&ver_uuid, ver_flags);
-	ver_desc.vf = ValOrFn::Value([0_u8, 0][..].into());
+	ver_desc.vf = ValOrFn::Value([1_u8, 0][..].into());
+
+    /*
+    let mut loc_desc = LocalDescBase::new(LOC_UUID, ver_flags);
+    let os_clone = out_syncer.clone();
+    loc_desc.vf = ValOrFn::Function(Box::new(move || {
+        os_clone.borrow().read_loc()
+    }));
+    */
+
+    let mut len_desc = LocalDescBase::new(LEN_UUID, ver_flags);
+    let os_clone = out_syncer.clone();
+    len_desc.vf = ValOrFn::Function(Box::new(move || {
+        RefCell::borrow(&os_clone).read_len()
+    }));
+
+    let mut mime_desc = LocalDescBase::new(MIME_UUID, ver_flags);
+    let os_clone = out_syncer.clone();
+    mime_desc.vf = ValOrFn::Function(Box::new(move || {
+        RefCell::borrow(&os_clone).read_mime()
+    }));
+
+    let mut mime_desc = LocalDescBase::new(MIME_UUID, ver_flags);
+    let os_clone = out_syncer.clone();
+    mime_desc.vf = ValOrFn::Function(Box::new(move || {
+        RefCell::borrow(&os_clone).read_mime()
+    }));
+
+    let mut hash_desc = LocalDescBase::new(HASH_UUID, ver_flags);
+    let os_clone = out_syncer.clone();
+    hash_desc.vf = ValOrFn::Function(Box::new(move || {
+        RefCell::borrow(&os_clone).read_hash()
+    }));
 
 	read_char.add_desc(ver_desc);
+    //read_char.add_desc(loc_desc);
+    read_char.add_desc(len_desc);
+    read_char.add_desc(mime_desc);
+    read_char.add_desc(hash_desc);
+
+
     copy_service.add_char(read_char);
     //permissions
     let write_uuid = WRITE_UUID.to_uuid();
@@ -121,15 +270,19 @@ fn main() {
     // setup write call back
     write_char.enable_write_fd(true);
     let mut syncer = InSyncer::default();
-    let last_written = Rc::new(RefCell::new(Vec::new()));
+    let last_written = Rc::new(RefCell::new(Clip::default()));
     let lw_clone = last_written.clone();
     // let (v, l) = syncer.read_fn();
     write_char.write_callback = Some(Box::new(move |bytes| {
+        if verbose >= 2 {
+            eprintln!("Received message: {:?}", bytes);
+        }
         match syncer.process_write(bytes) {
             Ok(buf) => {
                 if let Some(buf) = buf {
-                    update_clipboard(&buf);
-                    lw_clone.replace(buf);
+                    let clip = Clip::new(buf, "text/plain;charset=utf-8".to_string());
+                    update_clipboard(&clip);
+                    lw_clone.replace(clip);
                 }
                 false
             }
@@ -148,6 +301,9 @@ fn main() {
     write_serv.write_val_or_fn(&mut ValOrFn::Value(v, l));*/
 
     blue.add_service(copy_service).unwrap();
+    /*loop {
+        blue.process_requests().unwrap();
+    }*/
     blue.register_application().unwrap();
 
     let mut adv = Advertisement::new(AdType::Peripheral, name);
@@ -165,12 +321,23 @@ fn main() {
             idx
         }
     };
+    /*
     let mut copy_serv = blue.get_service(&serv_uuid).unwrap();
     let mut read_char = copy_serv.get_child(&read_uuid).unwrap();
     let os_clone = out_syncer.clone();
     read_char.write_val_or_fn(&mut ValOrFn::Function(Box::new(move || {
-        os_clone.borrow().read_fn()
+        if verbose > 2 {
+            eprintln!("Read characteristic read.");
+        }
+        let mut bm = os_clone.borrow_mut();
+        if let Some((old, new)) = bm.reduce_notify_len() {
+            if verbose >= 2 {
+                eprintln!("Erronous read, reducing notify_len from {} to {}", old, new);
+            }
+        }
+        bm.read_fn()
     })));
+    */
 
     let mut target = Instant::now();
     loop {
@@ -181,15 +348,17 @@ fn main() {
         let mut write_char = serv.get_child(&write_uuid).unwrap();
         write_char.check_write_fd();
 
-        // check for local updates to clipboard;
+        // check for the read characteristic
         let mut read_char = serv.get_child(&read_uuid).unwrap();
         read_char.check_write_fd();
-        if let Err(e) = out_syncer
-            .borrow_mut()
-            .indicate_local(&mut read_char, MAX_APP_MTU * 32)
+        let mut os_bor = out_syncer.borrow_mut();
+        if let Err(e) = os_bor.indicate_local(&mut read_char) 
         {
-            eprintln!("Error inidicating: {:?}", e);
+            eprintln!("Error indicating: {:?}", e);
         }
+        drop(os_bor);
+
+        // check for local updates to clipboard;
         if let None = target.checked_duration_since(now) {
             target = now + Duration::from_secs(2);
             let new_clip = match get_clipboard() {
@@ -201,7 +370,7 @@ fn main() {
                     continue;
                 }
             };
-            if out_syncer.borrow().get_buf() != &new_clip[..] && *last_written.borrow() != new_clip {
+            if RefCell::borrow(&out_syncer).get_clip() != &new_clip && *RefCell::borrow(&last_written) != new_clip {
                 println!("Writing: {:?}", new_clip);
                 out_syncer.replace(OutSyncer::new(new_clip, verbose));
             }
