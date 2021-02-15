@@ -204,58 +204,87 @@ impl OutSyncer {
 
 
 
-#[derive(Default)]
 pub struct InSyncer {
     hash: [u8; 32],
-    msg_length: usize,
+    msg_length: u32,
     data_buf: Vec<u8>,
+    mime: String,
+}
+
+impl Default for InSyncer {
+    fn default() -> Self {
+        Self {
+            msg_length: std::u32::MAX,
+            hash: [0; 32],
+            data_buf: Vec::new(),
+            mime: String::new()
+        }
+    }
 }
 
 impl InSyncer {
+    /*
     pub fn read_fn(&self) -> AttValue {
         let mut ret = AttValue::default();
-        ret.extend_from_slice(&self.data_buf.len().to_be_bytes()[4..8]);
-        ret.extend_from_slice(&self.msg_length.to_be_bytes()[4..8]);
-        ret.extend_from_slice(&self.hash);
+        if self.msg_length == 0 || self.msg_length as usize == self.data_buf.len() {
+            ret.extend_from_slice(&self.hash);
+        }
         return ret;
+    }*/
+    fn generate_char(&self, include_hash: bool) -> AttValue {
+        let mut ret = AttValue::default();
+        let len = self.data_buf.len();
+        let l_bytes = len.to_be_bytes();
+        ret.extend_from_slice(&self.data_buf.len().to_be_bytes()[4..8]);
+        if include_hash {
+            ret.extend_from_slice(&self.hash);
+        }
+        ret
     }
-    pub fn process_write(&mut self, v: &[u8]) -> Result<Option<Vec<u8>>, ()> {
-        let s: &Self = self;
-        if v.len() < 8 {
-            return Err(());
+    pub fn process_write(&mut self, v: &[u8]) -> (Option<Clip>, AttValue) {
+        if v.len() < 4 {
+            return (None, self.generate_char(true));
         }
         let mut int_buf = [0; 4];
         int_buf.copy_from_slice(&v[..4]);
-        let p_num = u32::from_be_bytes(int_buf);
-        int_buf.copy_from_slice(&v[4..8]);
-        let p_len = u32::from_be_bytes(int_buf) as usize;
-        if p_num == std::u32::MAX {
-            if v.len() != 40 {
-                let s: &Self = self;
-                return Err(());
+        let off = u32::from_be_bytes(int_buf);
+        if off == std::u32::MAX {
+            if v.len() < 40 {
+                return (None, self.generate_char(true));
             }
+            self.hash.copy_from_slice(&v[4..36]);
+            int_buf.copy_from_slice(&v[36..40]);
+            self.msg_length = u32::from_be_bytes(int_buf);
             self.data_buf.clear();
-            self.msg_length = p_len;
-            self.hash.copy_from_slice(&v[8..])
+            self.data_buf.reserve(self.msg_length as usize);
+            self.mime.clear();
+            let mime_str = match std::str::from_utf8(&v[40..]) {
+                Ok(s) => s,
+                Err(_) => return (None, self.generate_char(true))
+            };
+            self.mime.push_str(mime_str);
+            (None, self.generate_char(true))
+        } else if off as usize <= self.data_buf.len() {
+            let diff = self.data_buf.len() - off as usize;
+            let start = diff + 4;
+            let end = v.len().min(start + (self.msg_length as usize - self.data_buf.len()));
+            if start < v.len() {
+                for byte in &v[start..end] {
+                    self.data_buf.push(*byte);
+                }
+            }
+            let mut ret = None;
+            if self.data_buf.len() == self.msg_length as usize && off != self.msg_length {
+                let clip = Clip::new(self.data_buf.clone(), self.mime.clone());
+                if clip.hash() == self.hash {
+                    ret = Some(clip);
+                } else {
+                    self.msg_length = std::u32::MAX;
+                }
+            }
+            (ret, self.generate_char(false))
         } else {
-            if p_len + 8 != v.len() {
-                return Err(());
-            }
-            if self.data_buf.len() + p_len > self.msg_length {
-                return Err(());
-            }
-            self.data_buf.extend_from_slice(&v[8..]);
-        }
-        if self.data_buf.len() == self.msg_length {
-            let res = Sha256::digest(&self.data_buf);
-            if res.as_slice() == self.hash {
-                Ok(Some(self.data_buf.clone()))
-            } else {
-                self.data_buf.clear();
-                Err(())
-            }
-        } else {
-            Ok(None)
+            (None, self.generate_char(true))
         }
     }
 }

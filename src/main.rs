@@ -11,7 +11,7 @@ use std::rc::Rc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use airboard_server::{InSyncer, OutSyncer, Clip};
-use wl_clipboard_rs::paste::Error as PasteError;
+// use wl_clipboard_rs::paste::Error as PasteError;
 
 const COPY_UUID: &'static str = "4981333e-2d59-43b2-8dc3-8fedee1472c5";
 const READ_UUID: &'static str = "07178017-1879-451b-9bb5-3ff13bb85b70";
@@ -66,20 +66,19 @@ fn binary_search<T, K>(list: &[T], k: &K) -> Result<usize, usize>
 {
     list.binary_search_by(|p| p.borrow().cmp(k))
 }
-fn get_clipboard() -> Result<Clip, PasteError> {
+fn get_clipboard() -> std::io::Result<Clip> {
 
     loop {
         let mime_bytes = Command::new("wl-paste")
             .arg("-l")
-            .output().map_err(|e| PasteError::WaylandCommunication(e))?;
+            .output()?;
         // let mimes = get_mime_types(ClipboardType::Regular, Seat::Unspecified)?;
         let mimes: HashSet<String> = std::str::from_utf8(&mime_bytes.stdout)
-            .map_err(|_| PasteError::NoMimeType)?
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?
             .lines().map(|s| s.to_owned()).collect();
-        let mime = match resolve_mime_type(mimes) {
-            Some(mime) => mime,
-            None => return Err(PasteError::NoMimeType)
-        };
+
+        let mime = resolve_mime_type(mimes)
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
         let out = match Command::new("wl-paste")
             .arg("-n")
             .arg("-t")
@@ -270,26 +269,22 @@ fn main() {
     // setup write call back
     write_char.enable_write_fd(true);
     let mut syncer = InSyncer::default();
-    let last_written = Rc::new(RefCell::new(Clip::default()));
-    let lw_clone = last_written.clone();
+    //let last_written = Rc::new(RefCell::new(Clip::default()));
+    //let lw_clone = last_written.clone();
     // let (v, l) = syncer.read_fn();
+    let os_clone = out_syncer.clone();
     write_char.write_callback = Some(Box::new(move |bytes| {
         if verbose >= 2 {
             eprintln!("Received message: {:?}", bytes);
         }
-        match syncer.process_write(bytes) {
-            Ok(buf) => {
-                if let Some(buf) = buf {
-                    let clip = Clip::new(buf, "text/plain;charset=utf-8".to_string());
-                    update_clipboard(&clip);
-                    lw_clone.replace(clip);
-                }
-                false
-            }
-            Err(_) => true,
-        };
-        let cv = syncer.read_fn();
-        Ok((Some(ValOrFn::Value(cv)), true))
+        let (clip, val) = syncer.process_write(bytes);
+        eprintln!("write_char.write_callback(): replying with: {:?}", val);
+        if let Some(clip) = clip {
+            update_clipboard(&clip).ok();
+            //lw_clone.replace(clip);
+            os_clone.replace(OutSyncer::new(clip, verbose));
+        }
+        Ok((Some(ValOrFn::Value(val)), true))
     }));
 
 	let mut ver_desc = LocalDescBase::new(&ver_uuid, ver_flags);
@@ -321,23 +316,6 @@ fn main() {
             idx
         }
     };
-    /*
-    let mut copy_serv = blue.get_service(&serv_uuid).unwrap();
-    let mut read_char = copy_serv.get_child(&read_uuid).unwrap();
-    let os_clone = out_syncer.clone();
-    read_char.write_val_or_fn(&mut ValOrFn::Function(Box::new(move || {
-        if verbose > 2 {
-            eprintln!("Read characteristic read.");
-        }
-        let mut bm = os_clone.borrow_mut();
-        if let Some((old, new)) = bm.reduce_notify_len() {
-            if verbose >= 2 {
-                eprintln!("Erronous read, reducing notify_len from {} to {}", old, new);
-            }
-        }
-        bm.read_fn()
-    })));
-    */
 
     let mut target = Instant::now();
     loop {
@@ -370,7 +348,7 @@ fn main() {
                     continue;
                 }
             };
-            if RefCell::borrow(&out_syncer).get_clip() != &new_clip && *RefCell::borrow(&last_written) != new_clip {
+            if RefCell::borrow(&out_syncer).get_clip() != &new_clip {
                 println!("Writing: {:?}", new_clip);
                 out_syncer.replace(OutSyncer::new(new_clip, verbose));
             }
