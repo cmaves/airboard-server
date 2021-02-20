@@ -1,11 +1,13 @@
 
-use rustable::{Error as BLEError, MAX_APP_MTU, MAX_CHAR_LEN};
+use rustable::{Error as BLEError, MAX_APP_MTU};
 use rustable::gatt::{LocalChar, AttValue, ValOrFn};
 use sha2::{Digest, Sha256};
 
 use std::convert::TryInto;
+use std::rc::Rc;
 
 const MIN_NOTIFY_LEN: usize = 64;
+const MAX_OPT_CHAR_LEN: usize = 495;
 
 pub struct Clip {
     mime: String,
@@ -57,24 +59,38 @@ impl PartialEq<Clip> for Clip {
     }
 }
 
+fn optimal_mtu_downgrade(mtu: usize) -> usize {
+    if mtu >= 495 {
+        495
+    } else if mtu >= 244 {
+        244 
+    } else if mtu >= 169 {
+        169
+    } else if mtu >= 123 {
+        123
+    } else {
+        mtu
+    }
+}
+
 pub struct OutSyncer {
-    clip: Clip,
+    clip: Rc<Clip>,
     cur_pos: u32,
     written: u32,
     verbose: u8,
     notify_len: usize,
-    notify_max: usize,
+    bad_streak: bool,
 }
 
 impl OutSyncer {
-    pub fn new(clip: Clip, verbose: u8) -> Self {
+    pub fn new(clip: Rc<Clip>, verbose: u8) -> Self {
         OutSyncer {
             clip,
             cur_pos: std::u32::MAX,
             written: 0,
             verbose,
-            notify_max: MAX_APP_MTU,
             notify_len: MIN_NOTIFY_LEN,
+            bad_streak: false,
         }
     }
 	pub fn get_buf(&self) -> &[u8] {
@@ -83,17 +99,17 @@ impl OutSyncer {
     pub fn get_clip(&self) -> &Clip {
         &self.clip
     }
-    pub fn increment_notify_len(&mut self) -> usize {
+    fn increment_notify_len(&mut self) -> usize {
         self.notify_len += 1;
         self.notify_len
     }
     pub fn notify_len(&self) -> usize {
         self.notify_len
     }
-    pub fn reduce_notify_len(&mut self) -> Option<(usize, usize)> {
+    fn reduce_notify_len(&mut self) -> Option<(usize, usize)> {
         if self.clip.len() as u32 == self.cur_pos || self.cur_pos == std::u32::MAX {
             let old_len = self.notify_len;
-            self.notify_len = (self.notify_len * 7 / 8).max(MIN_NOTIFY_LEN);
+            self.notify_len = (self.notify_len * 3 / 4).max(MIN_NOTIFY_LEN);
             Some((old_len, self.notify_len))
         } else {
             None
@@ -107,15 +123,26 @@ impl OutSyncer {
             return Ok(());
         }
         if self.cur_pos == std::u32::MAX {
-            let v = self.read_fn();
+            let v = self.generate_char(self.cur_pos, MAX_OPT_CHAR_LEN);
             let ret = local_char.notify(Some(&mut ValOrFn::Value(v)));
             return ret;
         }
-        let max_out = self.notify_len * 1;
+        let pload_len = self.notify_len - 4;
+        let max_out = pload_len * 6;
         let target = self.clip.len().min(self.cur_pos as usize + max_out);
-        while (self.written as usize) < target {
+        
+        // we only want to send full messages
+        //let mut num_msg_to_send = (target - self.written as usize) / pload_len;
+        let diff = target - self.written as usize;
+        let num_msg_to_send = if diff % pload_len == 0 || target != self.clip.len() {
+            diff / pload_len
+        } else {
+            diff / pload_len + 1
+        };
+        for _ in 0..num_msg_to_send {
             let v = self.generate_char(self.written, self.notify_len);
             let len = v.len() - 4;
+            debug_assert!(len > 0);
             if self.verbose >= 2 {
                 eprintln!("Indicating at position {}.", self.written);
             }
@@ -139,11 +166,12 @@ impl OutSyncer {
         }
         v
     }
-    pub fn read_fn(&self) -> AttValue {
+    pub fn read_fn(&mut self) -> AttValue {
         /* In theory the MAX_CHAR_LEN should work but android will only accept charactertiscs of len
            MAX_CHAR_LEN - 1. Not sure if this is a bug or the standard.
          */
-        self.generate_char(self.cur_pos, MAX_CHAR_LEN - 1)
+        self.reduce_notify_len();
+        self.generate_char(self.cur_pos, MAX_OPT_CHAR_LEN)
 
     }
     /*
@@ -193,55 +221,104 @@ impl OutSyncer {
             } else {
                 if cur_pos <= self.cur_pos {
                     // a duplicate ACK was received
-                    self.written = cur_pos
+                    self.written = cur_pos;
+                    if !self.bad_streak {
+                        // if the first of a series of notifications fails,
+                        // only reduce_notify_len on the first failure.
+                        self.reduce_notify_len();
+                        self.bad_streak = true;
+                    }
+                } else if cur_pos > self.written {
+                    // In the event of a long read cur_pos could jump self.written
+                    // so we account for that.
+                    self.written = cur_pos;
+                } else {
+                    self.bad_streak = false;
+                    self.increment_notify_len();
                 }
-                self.written = self.written.max(cur_pos);
                 cur_pos
             };
         }
     }
 }
 
-
+enum BufOrDone {
+    Buf(Vec<u8>),
+    Done
+}
+impl BufOrDone {
+    fn reserve(&mut self, size: u32) {
+        match self {
+            BufOrDone::Buf(b) => b.reserve(size as usize),
+            BufOrDone::Done => *self = BufOrDone::Buf(Vec::with_capacity(size as usize))
+        }
+    }
+    fn reserve_and_clear(&mut self, size: u32) {
+        self.reserve(size);
+        if let BufOrDone::Buf(b) = self {
+            b.clear();
+        }
+    } 
+    fn take(&mut self) -> Option<Vec<u8>> {
+        let bod = std::mem::replace(self, BufOrDone::Done);
+        match bod {
+            BufOrDone::Buf(b) => {
+                Some(b)
+            },
+            BufOrDone::Done => None,
+        }
+    }
+}
 
 pub struct InSyncer {
+    local_clip: Rc<Clip>,
     hash: [u8; 32],
     msg_length: u32,
-    data_buf: Vec<u8>,
+    data_buf: BufOrDone,
     mime: String,
 }
 
 impl Default for InSyncer {
     fn default() -> Self {
         Self {
+            local_clip: Rc::new(Clip::default()),
             msg_length: std::u32::MAX,
             hash: [0; 32],
-            data_buf: Vec::new(),
+            data_buf: BufOrDone::Buf(Vec::new()),
             mime: String::new()
         }
     }
 }
 
 impl InSyncer {
-    /*
-    pub fn read_fn(&self) -> AttValue {
-        let mut ret = AttValue::default();
-        if self.msg_length == 0 || self.msg_length as usize == self.data_buf.len() {
-            ret.extend_from_slice(&self.hash);
+    pub fn new(local_clip: Rc<Clip>) -> Self {
+        Self {
+            local_clip,
+            ..Default::default()
         }
-        return ret;
-    }*/
+    }
+    fn recvd(&self) -> u32 {
+        match &self.data_buf {
+            BufOrDone::Buf(b) => b.len() as u32,
+            BufOrDone::Done => self.msg_length,
+        }
+    }
     fn generate_char(&self, include_hash: bool) -> AttValue {
         let mut ret = AttValue::default();
-        let len = self.data_buf.len();
-        let l_bytes = len.to_be_bytes();
-        ret.extend_from_slice(&self.data_buf.len().to_be_bytes()[4..8]);
+        ret.extend_from_slice(&self.recvd().to_be_bytes()[..]);
         if include_hash {
             ret.extend_from_slice(&self.hash);
         }
         ret
     }
-    pub fn process_write(&mut self, v: &[u8]) -> (Option<Clip>, AttValue) {
+    pub fn update_with_local(&mut self, local_clip: Rc<Clip>) {
+        self.local_clip = local_clip;
+    }
+    fn should_receive(&self) -> bool {
+        self.msg_length as usize != self.local_clip.len() || self.hash != self.local_clip.hash 
+            || self.mime != self.local_clip.mime
+    }
+    pub fn process_write(&mut self, v: &[u8]) -> (Option<Rc<Clip>>, AttValue) {
         if v.len() < 4 {
             return (None, self.generate_char(true));
         }
@@ -252,36 +329,62 @@ impl InSyncer {
             if v.len() < 40 {
                 return (None, self.generate_char(true));
             }
-            self.hash.copy_from_slice(&v[4..36]);
+            // determine if were we are in receiving this 
+            let hash = &v[4..36];
             int_buf.copy_from_slice(&v[36..40]);
-            self.msg_length = u32::from_be_bytes(int_buf);
-            self.data_buf.clear();
-            self.data_buf.reserve(self.msg_length as usize);
-            self.mime.clear();
-            let mime_str = match std::str::from_utf8(&v[40..]) {
-                Ok(s) => s,
-                Err(_) => return (None, self.generate_char(true))
-            };
-            self.mime.push_str(mime_str);
-            (None, self.generate_char(true))
-        } else if off as usize <= self.data_buf.len() {
-            let diff = self.data_buf.len() - off as usize;
-            let start = diff + 4;
-            let end = v.len().min(start + (self.msg_length as usize - self.data_buf.len()));
-            if start < v.len() {
-                for byte in &v[start..end] {
-                    self.data_buf.push(*byte);
-                }
-            }
-            let mut ret = None;
-            if self.data_buf.len() == self.msg_length as usize && off != self.msg_length {
-                let clip = Clip::new(self.data_buf.clone(), self.mime.clone());
-                if clip.hash() == self.hash {
-                    ret = Some(clip);
+            let msg_length = u32::from_be_bytes(int_buf);
+            let mime_bytes = &v[40..];
+            if self.hash != hash || self.msg_length != msg_length || self.mime.as_bytes() != mime_bytes {
+                self.mime.clear();
+                let mime_str = match std::str::from_utf8(&v[40..]) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        self.msg_length = std::u32::MAX;
+                        return (None, self.generate_char(true))
+                    }
+                };
+                self.mime.push_str(mime_str);
+                self.hash.copy_from_slice(hash);
+                self.msg_length = msg_length;
+                if self.should_receive() {
+                    self.data_buf.reserve_and_clear(msg_length);
                 } else {
-                    self.msg_length = std::u32::MAX;
+                    self.data_buf = BufOrDone::Done;
                 }
             }
+            (None, self.generate_char(true))
+        } else if off <= self.recvd() {
+            let ret = match &mut self.data_buf {
+                BufOrDone::Buf(data_buf) => {
+                    let diff = data_buf.len() - off as usize;
+                    let start = diff + 4;
+                    let end = v.len().min(start + (self.msg_length as usize - data_buf.len()));
+                    if start < v.len() {
+                        for byte in &v[start..end] {
+                            data_buf.push(*byte);
+                        }
+                    }
+                    if data_buf.len() == self.msg_length as usize {
+                        let clip = Clip::new(self.data_buf.take().unwrap(), self.mime.clone());
+                        if clip.hash() == self.hash {
+                            let clip = Rc::new(clip);
+                            self.local_clip = clip.clone();
+                            Some(clip)
+                        } else {
+                            let mut buf = clip.data;
+                            buf.clear();
+                            self.data_buf = BufOrDone::Buf(buf);
+                            self.msg_length = std::u32::MAX;
+                            None
+                        }
+                    } else { 
+                        None 
+                    }
+                },
+                BufOrDone::Done => {
+                    None
+                }
+            };
             (ret, self.generate_char(false))
         } else {
             (None, self.generate_char(true))

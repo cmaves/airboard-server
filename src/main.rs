@@ -66,7 +66,7 @@ fn binary_search<T, K>(list: &[T], k: &K) -> Result<usize, usize>
 {
     list.binary_search_by(|p| p.borrow().cmp(k))
 }
-fn get_clipboard() -> std::io::Result<Clip> {
+fn get_clipboard() -> std::io::Result<Rc<Clip>> {
 
     loop {
         let mime_bytes = Command::new("wl-paste")
@@ -88,7 +88,7 @@ fn get_clipboard() -> std::io::Result<Clip> {
             Ok(out) => out.stdout,
             Err(_) => continue
         };
-        return Ok(Clip::new(out, mime));
+        return Ok(Rc::new(Clip::new(out, mime)));
 
         /*
         let (mut out, _) = match get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Specific(&mime))        {
@@ -154,9 +154,11 @@ fn main() {
         Ok(o) => o,
         Err(e) => {
             eprintln!("Failed to read clipboard: {:?}", e);
-            Clip::default()
+            Rc::new(Clip::default())
         }
     };
+
+    let in_syncer = Rc::new(RefCell::new(InSyncer::new(cur_clip.clone())));
     let out_syncer = Rc::new(RefCell::new(OutSyncer::new(cur_clip, verbose)));
 
     /*
@@ -198,13 +200,7 @@ fn main() {
         if verbose > 2 {
             eprintln!("Read characteristic read.");
         }
-        let mut bm = os_clone.borrow_mut();
-        if let Some((old, new)) = bm.reduce_notify_len() {
-            if verbose >= 2 {
-                eprintln!("Erronous read, reducing notify_len from {} to {}", old, new);
-            }
-        }
-        bm.read_fn()
+        os_clone.borrow_mut().read_fn()
     })));
 
 	// create protocol version descriptor
@@ -268,16 +264,17 @@ fn main() {
     let mut write_char = LocalCharBase::new(&write_uuid, write_flags);
     // setup write call back
     write_char.enable_write_fd(true);
-    let mut syncer = InSyncer::default();
     //let last_written = Rc::new(RefCell::new(Clip::default()));
     //let lw_clone = last_written.clone();
     // let (v, l) = syncer.read_fn();
     let os_clone = out_syncer.clone();
+    let is_clone = in_syncer.clone();
+    
     write_char.write_callback = Some(Box::new(move |bytes| {
         if verbose >= 2 {
             eprintln!("Received message: {:?}", bytes);
         }
-        let (clip, val) = syncer.process_write(bytes);
+        let (clip, val) = is_clone.borrow_mut().process_write(bytes);
         eprintln!("write_char.write_callback(): replying with: {:?}", val);
         if let Some(clip) = clip {
             update_clipboard(&clip).ok();
@@ -348,8 +345,9 @@ fn main() {
                     continue;
                 }
             };
-            if RefCell::borrow(&out_syncer).get_clip() != &new_clip {
+            if RefCell::borrow(&out_syncer).get_clip() != &*new_clip {
                 println!("Writing: {:?}", new_clip);
+                in_syncer.borrow_mut().update_with_local(new_clip.clone());
                 out_syncer.replace(OutSyncer::new(new_clip, verbose));
             }
             match blue.restart_adv(adv_idx) {
