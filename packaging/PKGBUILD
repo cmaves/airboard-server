@@ -6,12 +6,12 @@
 # Maintainer: Curtis Maves <curtis@maves.io>
 pkgname=airboard-git
 _pkgname=airboard
-pkgver=0.2.1.g1fadd2f
+pkgver=0.2.1.g3296fa5
 pkgrel=1
 pkgdesc="User daemon that syncs the local clipboard with remote Android devices."
 arch=('x86_64')
 url="https://github.com/cmaves/airboard-server"
-license=('GPL')
+license=('GPLv3')
 depends=('dbus' 'bluez')
 makedepends=('git' 'rust')
 checkdepends=()
