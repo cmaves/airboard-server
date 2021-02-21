@@ -1,0 +1,8 @@
+[Unit]
+Description=Airboard GATT server 
+
+[Service]
+ExecStart=/usr/bin/airboard-server -v -n
+
+[Install]
+WantedBy=default.target
