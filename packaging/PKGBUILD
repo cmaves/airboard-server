@@ -1,0 +1,38 @@
+# This is an example PKGBUILD file. Use this as a start to creating your own,
+# and remove these comments. For more information, see 'man PKGBUILD'.
+# NOTE: Please fill out the license field for your package! If it is unknown,
+# then please put 'unknown'.
+
+# Maintainer: Curtis Maves <curtis@maves.io>
+pkgname=airboard-git
+_pkgname=airboard
+pkgver=0.2.1.g1fadd2f
+pkgrel=1
+pkgdesc="User daemon that syncs the local clipboard with remote Android devices."
+arch=('x86_64')
+url="https://github.com/cmaves/airboard-server"
+license=('GPL')
+depends=('dbus' 'bluez')
+makedepends=('git' 'rust')
+checkdepends=()
+optdepends=()
+provides=("airboard=$pkgver")
+conflicts=('airboard')
+source=("$_pkgname::git+https://github.com/cmaves/airboard-server.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd $_pkgname
+    echo "$(grep ^version Cargo.toml | cut -d\" -f2).g$(git rev-parse --short HEAD)"
+}
+
+build() {
+	cd "$_pkgname"
+    cargo build --release
+}
+
+package() {
+	cd "$_pkgname"
+    install -D -m755 target/release/airboard-server "$pkgdir/usr/bin/airboard-server"
+    install -D -m644 airboard.service "$pkgdir/usr/lib/systemd/user/airboard.service"
+}
